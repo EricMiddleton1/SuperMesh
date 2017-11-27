@@ -1,7 +1,7 @@
 #pragma once
 
 #include <array>
-#include "vector.hpp"
+#include <vector>
 
 class Router {
 public:
@@ -17,39 +17,52 @@ public:
 	struct Route {
 		Link link;
 		Address nextHop;
-
-		unsigned int ttl;
 	};
 
-	Router();
+	Router(ChipID myID);
+
+	bool getNextHop(Address& nextHop, const ChipID& id) const;
 
 	//Update information about this device's own neighbor routes
-	void updateNeighbor(vector<Route>&& neighbors);
+	void updateNeighbors(const std::vector<Route>& neighbors);
+	
+	//Instructs the router to recreate routing table
+	//using Dijkstra's algorithm
+	void updateRoutingTable();
 
 	//Process update from neighbor device
-	void processLinkUpdate(const Address& from, CostType cost,
-		Link* links, size_t length);
+	void processLinkUpdate(const ChipID& fromID, Link* links, size_t length);
 
-	void exportNeighborTable(vector<Link>& routes);
+	void exportNeighborTable(std::vector<Link>& neighbors) const;
+
+	std::vector<Route> getRoutingTable() const;
+	
+	void printNetworkGraph() const;
+
+	static std::string toString(const ChipID& id);
 
 private:
-	static constexpr MAX_TTL = 5;
-
 	struct Node {
 		struct Edge {
 			size_t nodeIndex;
 			CostType cost;
 		};
 
-		Address addr;
-		vector<Edge> edges;
-		size_t reverseEdgeCount;
+		Node(const ChipID& id);
 
-		bool mark;
-		int cost;
+		ChipID id;
+		std::vector<Edge> edges;
+
+		bool mark, processed;
+		CostType cost;
+		int prev;
 	};
 
-	vector<Node> networkGraph;
-	vector<Route> routingTable;
-	vector<Route> neighbors;
+	size_t getNodeIndex(const ChipID& id) const;
+
+	ChipID myID;
+
+	std::vector<Node> networkGraph;
+	std::vector<Route> routingTable;
+	std::vector<Route> neighbors;
 };
