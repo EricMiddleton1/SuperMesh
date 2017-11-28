@@ -3,6 +3,7 @@
 #include <array>
 #include <vector>
 
+#include <Arduino.h>
 #include <ESP8266WiFi.h>
 
 class Router {
@@ -25,6 +26,8 @@ public:
 
   void begin(const ChipID& id);
 
+  ChipID getChipID() const;
+
   bool getNextHop(Address& nextHop, const ChipID& id) const;
 
   //Update information about this device's own neighbor routes
@@ -42,6 +45,9 @@ public:
   std::vector<Route> getRoutingTable() const;
 
   void printNetworkGraph() const;
+
+  static String chipIDToString(const ChipID& id);
+  static ChipID StringToChipID(const String& str);
 
 private:
   struct Node {

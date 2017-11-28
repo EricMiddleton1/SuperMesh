@@ -23,6 +23,10 @@ void Router::begin(const ChipID& id) {
   networkGraph.emplace_back(myID);
 }
 
+Router::ChipID Router::getChipID() const {
+  return myID;
+}
+
 bool Router::getNextHop(Address& nextHop, const ChipID& id) const {
   auto route = std::find_if(routingTable.begin(), routingTable.end(),
     [&id](const Route& r) {
