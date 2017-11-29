@@ -140,7 +140,7 @@ void Router::updateRoutingTable() {
   }
 }
 
-void Router::processLinkUpdate(const ChipID& fromID, Link* links, size_t length) {
+void Router::processLinkUpdate(const ChipID& fromID, const Link* links, size_t length) {
 
   auto nodeIndex = getNodeIndex(fromID);
 
@@ -185,18 +185,60 @@ size_t Router::getNodeIndex(const ChipID& id) const {
   return found - networkGraph.begin();
 }
 
-void Router::printNetworkGraph() const {
-  /*
-  std::cout << "Network Graph - " << networkGraph.size() << " nodes\n";
+void Router::printRoutingTable() const {
+  Serial.print("Routing Table - ");
+  Serial.print(routingTable.size());
+  Serial.println(" entries");
 
-  for(const auto& node : networkGraph) {
-    std::cout << "\t" << toString(node.id) << "\t\t\t" << node.cost << "\n";
-    for(const auto& edge : node.edges) {
-      std::cout << "\t\t" << toString(networkGraph[edge.nodeIndex].id)
-        << "\t\t" << networkGraph[edge.nodeIndex].cost << "\n";
+  if(!routingTable.empty()) {
+    Serial.println("\tChipID\t\t\tNext Hop\t\t\tCost");
+    for(const auto& route : routingTable) {
+      Serial.print("\t");
+      Serial.print(chipIDToString(route.link.target));
+      Serial.print("\t");
+      Serial.print(route.nextHop);
+      Serial.print("\t\t\t");
+      Serial.println(route.link.cost);
     }
   }
-
-  std::cout << std::flush;
-  */
 }
+
+void Router::printNetworkGraph() const {
+  Serial.print("Network Graph - ");
+  Serial.print(networkGraph.size());
+  Serial.println(" nodes");
+
+  for(const auto& node : networkGraph) {
+    Serial.print("\t");
+    Serial.print(chipIDToString(node.id));
+    Serial.print("\t\t\t");
+    Serial.println(node.cost);
+    for(const auto& edge : node.edges) {
+      Serial.print("\t\t");
+      Serial.print(chipIDToString(networkGraph[edge.nodeIndex].id));
+      Serial.print("\t\t\t");
+      Serial.println(networkGraph[edge.nodeIndex].cost);
+    }
+  }
+}
+
+String Router::chipIDToString(const ChipID& id) {
+  return String(id[0], HEX) + ":"
+    + String(id[1], HEX) + ":"
+    + String(id[2], HEX) + ":"
+    + String(id[3], HEX) + ":"
+    + String(id[4], HEX) + ":"
+    + String(id[5], HEX);
+}
+
+Router::ChipID Router::stringToChipID(const String& str) {
+  ChipID id;
+
+  for(int i = 0; i < id.size(); ++i) {
+    auto substr = str.substring(3*i, 3*i+2);
+    id[i] = strtol(substr.c_str(), nullptr, 16);
+  }
+
+  return id;
+}
+

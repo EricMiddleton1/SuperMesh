@@ -38,16 +38,17 @@ public:
   void updateRoutingTable();
 
   //Process update from neighbor device
-  void processLinkUpdate(const ChipID& fromID, Link* links, size_t length);
+  void processLinkUpdate(const ChipID& fromID, const Link* links, size_t length);
 
   void exportNeighborTable(std::vector<Link>& neighbors) const;
 
   std::vector<Route> getRoutingTable() const;
 
+  void printRoutingTable() const;
   void printNetworkGraph() const;
 
   static String chipIDToString(const ChipID& id);
-  static ChipID StringToChipID(const String& str);
+  static ChipID stringToChipID(const String& str);
 
 private:
   struct Node {
