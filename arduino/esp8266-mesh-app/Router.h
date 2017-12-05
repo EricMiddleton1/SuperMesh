@@ -42,6 +42,8 @@ public:
 
   void exportNeighborTable(std::vector<Link>& neighbors) const;
 
+  std::vector<ChipID> getAllNodes() const;
+
   std::vector<Route> getRoutingTable() const;
 
   void printRoutingTable() const;

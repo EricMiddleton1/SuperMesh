@@ -6,9 +6,16 @@ void datagramHandler(Mesh::Datagram datagram);
 
 Mesh mesh{datagramHandler};
 
+const int BUTTON = 0;
+const unsigned long DEBOUNCE_TIME = 500;
+
+unsigned long buttonTime = 0;
+
 void setup() {
   Serial.begin(115200);
   Serial.println();
+
+  pinMode(BUTTON, INPUT);
 
   Serial.print("[Info] Starting mesh...");
   mesh.begin();
@@ -16,6 +23,14 @@ void setup() {
 }
 
 void loop() {
+  auto curTime = millis();
+  
+  if(digitalRead(BUTTON) == LOW && curTime >= buttonTime) {
+    mesh.runNetworkTest();
+
+    buttonTime = curTime + DEBOUNCE_TIME;
+  }
+  
   mesh.run();
 }
 

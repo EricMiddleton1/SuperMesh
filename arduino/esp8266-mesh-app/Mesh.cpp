@@ -8,10 +8,14 @@ Mesh::Mesh(const DatagramHandler& _handler)
   , nextHelloTime{0}
   , nextRouteTime{0}
   , nextConnectTime{0}
+  , nextPingTime{0}
+  , pingState{-1}
   , routeSeqNum{0} {
 }
 
 void Mesh::begin() {
+  pinMode(VERBOSE_PIN, INPUT);
+  digitalWrite(VERBOSE_PIN, HIGH);
   
   WiFi.disconnect();
   
@@ -107,6 +111,48 @@ void Mesh::run() {
       sendPacket(apNeighbor.nextHop, packet, Type::Hello);
     }
   }
+
+  if(pingState != -1 && curTime >= nextPingTime) {
+    nextPingTime = curTime + PING_PERIOD;
+
+    if(pingState > 0) {
+      ping();
+      pingState--;
+    }
+    else {
+      int responses = std::count(pingTimes.begin(), pingTimes.end(), 0);
+      float avgTime = (responses == 0) ? 0.f : totalPingTime / (1000.f*responses);
+
+      Serial.print("Ping Report - ");
+      Serial.println(Router::chipIDToString(pingQueue.front()));
+      Serial.print("\t");
+      Serial.print(pingTimes.size());
+      Serial.print(" packets transmitted, ");
+      Serial.print(responses);
+      Serial.print(" received, ");
+      Serial.print(100 - 100*responses/pingTimes.size());
+      Serial.print("% packet loss, average rtt = ");
+      Serial.print(avgTime);
+      Serial.println(" ms\n");
+
+      pingQueue.pop();
+      if(pingQueue.empty()) {
+        pingState = -1;
+
+        Serial.println("-----Network Test Complete-----");
+      }
+      else {
+        pingTimes.clear();
+        totalPingTime = 0;
+
+        Serial.print("Ping - ");
+        Serial.println(Router::chipIDToString(pingQueue.front()));
+        
+        ping();
+        pingState = 4;
+      }
+    }
+  }
   
   if(curTime >= nextRouteTime) {
     nextRouteTime = (nextRouteTime == 0 ? curTime : nextRouteTime) + ROUTE_PERIOD;
@@ -155,11 +201,13 @@ void Mesh::run() {
 //    Serial.println("[Info] Updating routing table");
     router.updateNeighbors(neighbors);
     router.updateRoutingTable();
-    router.printNetworkGraph();
 
-    Serial.println("[Info] Routing Table:");
-    router.printRoutingTable();
-    Serial.println();
+    if(digitalRead(VERBOSE_PIN) == LOW) {
+      router.printNetworkGraph();
+
+      router.printRoutingTable();
+      Serial.println();
+    }
   }
 
   if(curTime >= nextConnectTime) {
@@ -200,6 +248,10 @@ void Mesh::run() {
           processRoutePacket(packet);
         break;
 
+        case static_cast<int>(Type::Ping):
+          processPingPacket(packet);
+        break;
+
         case static_cast<int>(Type::Datagram):
           if(packet.size() >= sizeof(Router::ChipID)) {
             Router::ChipID target;
@@ -224,6 +276,61 @@ void Mesh::run() {
           Serial.println(static_cast<int>(type));
         break;
       }
+    }
+  }
+}
+
+void Mesh::runNetworkTest() {
+  router.printNetworkGraph();
+  router.printRoutingTable();
+  Serial.println();
+  
+  if(pingQueue.empty()) {
+    Serial.println("-----Starting Network Test-----");
+    
+    auto nodes = router.getAllNodes();
+
+    if(!nodes.empty()) {
+      for(const auto& node : nodes) {
+        pingQueue.push(node);
+      }
+      pingTimes.clear();
+      totalPingTime = 0;
+  
+      Serial.print("Ping - ");
+      Serial.println(Router::chipIDToString(pingQueue.front()));
+      
+      ping();
+      pingState = 4;
+    }
+    else {
+      Serial.println("-----Network Test Complete-----");
+    }
+  }
+}
+
+void Mesh::ping() {
+  if(pingQueue.empty()) {
+    Serial.println("[Error] Ping(): pingQueue is empty");
+  }
+  else {
+    auto me = router.getChipID();
+    const auto& target = pingQueue.front();
+    
+    std::vector<uint8_t> packet;
+  
+    packet.push_back(pingTimes.size());
+    packet.insert(packet.end(), target.begin(), target.end());
+    packet.insert(packet.end(), me.begin(), me.end());
+
+    IPAddress nextHop;
+    if(router.getNextHop(nextHop, target)) {
+      sendPacket(nextHop, packet, Type::Ping);
+      pingTimes.push_back(micros());
+    }
+    else {
+      Serial.print("Ping - No route to device ");
+      Serial.println(Router::chipIDToString(target));
     }
   }
 }
@@ -315,6 +422,84 @@ void Mesh::processRoutePacket(const std::vector<uint8_t>& packet) {
 
       //Forward to other neighbors
       sendPacketToNeighbors(packet, Type::RouteUpdate, id);
+    }
+  }
+}
+
+void Mesh::processPingPacket(const std::vector<uint8_t>& packet) {
+  auto curTime = micros();
+  
+  Router::ChipID sender, target, me = router.getChipID();
+
+  std::copy(packet.begin()+1, packet.begin()+7, target.begin());
+  std::copy(packet.begin()+7, packet.begin()+13, sender.begin());
+
+  bool toForward = true;;
+
+  if(target == me) {
+    if(sender == me) {
+      toForward = false;
+      int seqNum = packet[0];
+
+      if(seqNum >= pingTimes.size()) {
+        Serial.println("[Error] Ping: Invalid sequence number");
+      }
+      else {
+        if(pingTimes[seqNum] == 0) {
+          Serial.print("[Info] Ping: Received duplicate response (");
+          Serial.print((int)seqNum);
+          Serial.println(")");
+        }
+        else {
+          auto dt = curTime - pingTimes[seqNum];
+          
+          Serial.print("\tPing response (");
+          Serial.print((int)seqNum);
+          Serial.print("): ");
+          Serial.print(dt/1000.f);
+          Serial.print("ms\n\tRoute: ");
+
+          int hopCount = (packet.size()-7)/6;
+          for(int i = 0; i < hopCount; ++i) {
+            Router::ChipID hop;
+            int offset = 7+6*i;
+            std::copy(packet.begin()+offset, packet.begin()+offset+6, hop.begin());
+
+            Serial.print(Router::chipIDToString(hop));
+            Serial.print("->");
+          }
+          Serial.println(Router::chipIDToString(me));
+          Serial.println();
+  
+          pingTimes[seqNum] = 0;
+          totalPingTime += dt;
+        }
+      }
+    }
+    else {
+      target = sender;
+      toForward = true;
+    }
+  }
+
+  if(toForward) {
+    std::vector<uint8_t> newPacket = packet;
+    std::copy(target.begin(), target.end(), newPacket.begin()+1);
+    newPacket.insert(newPacket.end(), me.begin(), me.end());
+  
+    Serial.print("[Info] Ping: Forwarding packet (from ");
+    Serial.print(Router::chipIDToString(sender));
+    Serial.print(" to ");
+    Serial.print(Router::chipIDToString(target));
+    Serial.println(")");
+  
+    IPAddress nextHop;
+    if(router.getNextHop(nextHop, target)) {
+      sendPacket(nextHop, newPacket, Type::Ping);
+    }
+    else {
+      Serial.print("Ping Forward - No route to device ");
+      Serial.println(Router::chipIDToString(target));
     }
   }
 }

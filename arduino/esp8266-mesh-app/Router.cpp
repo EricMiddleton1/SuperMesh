@@ -42,6 +42,16 @@ bool Router::getNextHop(Address& nextHop, const ChipID& id) const {
   }
 }
 
+std::vector<Router::ChipID> Router::getAllNodes() const {
+  std::vector<ChipID> nodes;
+
+  for(const auto& node : routingTable) {
+    nodes.push_back(node.link.target);
+  }
+
+  return nodes;
+}
+
 void Router::updateNeighbors(const vector<Route>& _neighbors) {
   neighbors = _neighbors;
   
@@ -217,7 +227,7 @@ void Router::printNetworkGraph() const {
       Serial.print("\t\t");
       Serial.print(chipIDToString(networkGraph[edge.nodeIndex].id));
       Serial.print("\t\t\t");
-      Serial.println(networkGraph[edge.nodeIndex].cost);
+      Serial.println(edge.cost);
     }
   }
 }
