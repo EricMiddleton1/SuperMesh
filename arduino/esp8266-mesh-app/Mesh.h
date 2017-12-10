@@ -7,7 +7,12 @@
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
+#include <ESP8266WiFiType.h>
 #include <WiFiUdp.h>
+
+extern "C" {
+  #include "os_type.h"
+}
 
 #include "Router.h"
 
@@ -26,12 +31,13 @@ public:
 private:
   static const uint16_t PORT = 1245;
   static const int HELLO_PERIOD = 1000;
-  static const int ROUTE_PERIOD = 2500;
+  static const int ROUTE_PERIOD = 5000;
   static const int CONNECT_PERIOD = 15000;
   static const int PING_PERIOD = 1000;
   static const int NEIGHBOR_MAX_TTL = 3;
   static const int VERBOSE_PIN = 2;
   static constexpr char* SSID_START = "esp8266-mesh-";
+  static const int CHANNEL = 6;
 
   enum class Type {
     Hello = 0x00,
@@ -50,9 +56,20 @@ private:
     Router::CostType cost;
   };
 
-  void setRandomSubnet();
+  /******WiFi Event Callbacks******/
+  /*
+  void cbStationModeDisconnected(const WiFiEventStationModeDisconnected&);
+  void cbStationModeGotIP(const WiFiEventModeGotIP&);
+  void cbSoftAPModeStationConnected(const WiFiEventSoftAPModeStationConnected&);
+  void cbSoftAPModeStationDisconnected(const WiFiEventSoftAPModeStationDisconnected&);
+  */
+  void cbStationScan(void *bssInfo, STATUS status);
 
-  void processWiFiScan(int networkCount);
+  /******Timer Callbacks******/
+  void cbHelloTimer();
+  void cbRouteTimer();
+
+  void setRandomSubnet();
 
   void ping();
 
@@ -69,6 +86,8 @@ private:
   static bool ssidToChipID(Router::ChipID& out, const String& ssid);
   static String chipIDToSSID(const Router::ChipID& id);
 
+  Router::ChipID myID;
+
   DatagramHandler handler;
   Router router;
 
@@ -81,8 +100,8 @@ private:
 
   int status;
 
-  unsigned long nextHelloTime;
-  unsigned long nextRouteTime;
+  os_timer_t helloTimer, routeTimer, pingTimer;
+
   unsigned long nextConnectTime;
   unsigned long nextPingTime;
 
