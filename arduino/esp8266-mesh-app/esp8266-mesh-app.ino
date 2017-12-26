@@ -3,14 +3,14 @@
 
 #include "Mesh.h"
 
-void datagramHandler(Mesh::Datagram datagram);
-
-Mesh mesh{datagramHandler};
+Mesh mesh;
 
 const int BUTTON = 0;
 const unsigned long DEBOUNCE_TIME = 500;
 
 unsigned long buttonTime = 0;
+
+const char* MESH_NAME = "SuperMesh";
 
 void setup() {
   Serial.begin(115200);
@@ -19,7 +19,7 @@ void setup() {
   pinMode(BUTTON, INPUT);
 
   Serial.print("[Info] Starting mesh...");
-  mesh.begin();
+  mesh.begin(MESH_NAME);
   Serial.println("done");
 }
 
@@ -27,12 +27,10 @@ void loop() {
   auto curTime = millis();
   
   if(digitalRead(BUTTON) == LOW && curTime >= buttonTime) {
-    mesh.runNetworkTest();
+    //mesh.runNetworkTest();
 
     buttonTime = curTime + DEBOUNCE_TIME;
   }
-  
-  mesh.run();
 }
 
 void datagramHandler(std::vector<uint8_t> datagram) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <vector>
 #include <map>
 #include <queue>
@@ -8,42 +9,50 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WiFiType.h>
-#include <WiFiUdp.h>
+#include <ESPAsyncUDP.h>
 
 extern "C" {
   #include "os_type.h"
 }
 
 #include "Router.h"
+#include "Message.h"
+#include "Types.h"
 
 class Mesh {
 public:
-  using Datagram = std::vector<uint8_t>;
-  using DatagramHandler = std::function<void(Datagram)>;
+  using MessageHandler = std::function<void(Message)>;
   
-  Mesh(const DatagramHandler& handler);
+  Mesh();
 
-  void begin();
+  void begin(const String& meshName);
 
-  void runNetworkTest();
+  void onMessage(const MessageHandler& handler);
 
-  void run();
+  bool send(const Message& msg, const ChipID& destination);
+
+  static String chipIDToString(const ChipID& id);
+  static ChipID stringToChipID(const String& str);
+  
 private:
   static const uint16_t PORT = 1245;
   static const int HELLO_PERIOD = 1000;
   static const int ROUTE_PERIOD = 5000;
-  static const int CONNECT_PERIOD = 15000;
-  static const int PING_PERIOD = 1000;
+  static const int SCAN_PERIOD = 2000;
+  static const int CONNECT_TIMEOUT = 15000;
   static const int NEIGHBOR_MAX_TTL = 3;
-  static const int VERBOSE_PIN = 2;
-  static constexpr char* SSID_START = "esp8266-mesh-";
   static const int CHANNEL = 6;
 
-  enum class Type {
-    Hello = 0x00,
-    RouteUpdate = 0x01,
-    Ping = 0x02,
-    Datagram = 0x10
+  static const int TYPE_HELLO = 0x00;
+  static const int TYPE_ROUTE = 0x01;
+  static const int TYPE_PING = 0x02;
+  static const int TYPE_DESTINATION_UNREACHABLE = 0x03;
+  static const int TYPE_MESSAGE = 0x10;
+
+  enum WiFiState {
+    Disconnected,
+    Connecting,
+    Connected
   };
 
   struct Neighbor {
@@ -52,65 +61,63 @@ private:
   };
 
   struct SSID {
-    Router::ChipID id;
+    ChipID id;
     Router::CostType cost;
   };
 
   /******WiFi Event Callbacks******/
   /*
-  void cbStationModeDisconnected(const WiFiEventStationModeDisconnected&);
-  void cbStationModeGotIP(const WiFiEventModeGotIP&);
   void cbSoftAPModeStationConnected(const WiFiEventSoftAPModeStationConnected&);
   void cbSoftAPModeStationDisconnected(const WiFiEventSoftAPModeStationDisconnected&);
   */
-  void cbStationScan(void *bssInfo, STATUS status);
 
-  /******Timer Callbacks******/
+  /******Callbacks******/
+  void cbStationModeDisconnected(const WiFiEventStationModeDisconnected&);
+  void cbStationModeGotIP(const WiFiEventStationModeGotIP&);
   void cbHelloTimer();
   void cbRouteTimer();
+  void cbScanTimer();
+  void cbStationScan(void *bssInfo, STATUS status);
+  void processHelloPacket(Message msg);
+  void processRoutePacket(Message msg);
+
+  void startScan();
+  void connect(const String& ssid);
+
+  bool send(const Message& msg, const ChipID& destination, uint8_t type);
+  void sendToNeighbors(const Message& msg, uint8_t type, const ChipID& except);
+
+  void processPacket(AsyncUDPPacket packet);
+  bool isDuplicate(const ChipID& id, uint16_t sequenceNumber) const;
+
+  void registerHandler(uint8_t type, const MessageHandler& handler);
 
   void setRandomSubnet();
 
-  void ping();
-
-  void processHelloPacket(const std::vector<uint8_t>& packet);
-  void processRoutePacket(const std::vector<uint8_t>& packet);
-  void processPingPacket(const std::vector<uint8_t>& packet);
-
-  void sendPacketToNeighbors(const std::vector<uint8_t>& packet, Type type, uint8_t hopCount = 0);
-  void sendPacketToNeighbors(const std::vector<uint8_t>& packet, Type type, const Router::ChipID& ignore, uint8_t hopCount = 0);
-  void sendPacket(const IPAddress& ip, const std::vector<uint8_t>& packet, Type type, uint8_t hopCount = 0);
-
   static IPAddress getDefaultGateway();
 
-  static bool ssidToChipID(Router::ChipID& out, const String& ssid);
-  static String chipIDToSSID(const Router::ChipID& id);
+  bool ssidToChipID(ChipID& out, const String& ssid);
+  String chipIDToSSID(const ChipID& id);
 
-  Router::ChipID myID;
+  static bool isBroadcast(const ChipID& id);
 
-  DatagramHandler handler;
+  /*
+   * Routing and connection-related variables
+   */
   Router router;
-
+  ChipID myID;
   std::vector<Neighbor> stationNeighbors;
   Router::Route apNeighbor;
-
   std::vector<SSID> ssids;
+  std::map<ChipID, uint16_t> sequenceTable;
+  WiFiState wifiState;
+  WiFiEventHandler connectHandler, disconnectHandler;
 
-  WiFiUDP socket;
+  String meshName_;
 
-  int status;
+  std::map<uint8_t, MessageHandler> messageHandlers;
 
-  os_timer_t helloTimer, routeTimer, pingTimer;
+  AsyncUDP socket;
 
-  unsigned long nextConnectTime;
-  unsigned long nextPingTime;
-
-  uint16_t routeSeqNum;
-
-  int pingState;
-  std::vector<unsigned long long> pingTimes;
-  int totalPingTime;
-  std::queue<Router::ChipID> pingQueue;
-
-  std::map<Router::ChipID, uint16_t> routeSeqTable;
+  os_timer_t helloTimer, routeTimer, scanTimer;
 };

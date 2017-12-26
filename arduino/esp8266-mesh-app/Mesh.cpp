@@ -9,32 +9,44 @@ extern "C" {
 
 static Mesh* __meshPtr = nullptr;
 
-Mesh::Mesh(const DatagramHandler& _handler)
-  : handler{_handler}
-  , status{-1}
-  , nextConnectTime{0}
-  , nextPingTime{0}
-  , pingState{-1}
-  , routeSeqNum{0} {
+Mesh::Mesh() {
 }
 
-void Mesh::begin() {
+void Mesh::begin(const String& meshName) {
   __meshPtr = this;
 
+  meshName_ = meshName;
+
+  //Load device ID
+  WiFi.macAddress(myID.data());  
+
+  //Seed RNG from unique device ID
   int seed = (myID[3] << 16) | (myID[4] << 8) | myID[5];
   srand(seed);
 
-  WiFi.macAddress(myID.data());
+  //Initialize the router subsystem
   router.begin(myID);
 
   /**************************
   ****Wi-Fi Initialization***
   **************************/
+  wifiState = WiFiState::Disconnected;
+  disconnectHandler = WiFi.onStationModeDisconnected([this](const WiFiEventStationModeDisconnected& arg) {
+    cbStationModeDisconnected(arg);
+  });
+
+  connectHandler = WiFi.onStationModeGotIP([this](const WiFiEventStationModeGotIP& arg) {
+    cbStationModeGotIP(arg);
+  });
+  
   WiFi.disconnect();
+  WiFi.persistent(false);
 
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(chipIDToSSID(myID).c_str(), "", CHANNEL);
   setRandomSubnet();
+
+  startScan();
 
   Serial.print("[Info] SoftAP Default Gateway: ");
   Serial.println(WiFi.softAPIP());
@@ -46,49 +58,39 @@ void Mesh::begin() {
   os_timer_arm(&helloTimer, HELLO_PERIOD, 1);
   os_timer_setfn(&routeTimer, [](void* arg) { reinterpret_cast<Mesh*>(arg)->cbRouteTimer(); }, this);
   os_timer_arm(&routeTimer, ROUTE_PERIOD, 1);
+  os_timer_setfn(&scanTimer, [](void* arg) { reinterpret_cast<Mesh*>(arg)->cbScanTimer(); }, this);
+  os_timer_arm(&scanTimer, SCAN_PERIOD, 1);
   
-  pinMode(VERBOSE_PIN, INPUT);
-  digitalWrite(VERBOSE_PIN, HIGH);
-
-  if(socket.begin(PORT) == 0) {
+  if(socket.listen(PORT)) {
+    socket.onPacket([this](AsyncUDPPacket p) { processPacket(std::move(p)); });
+  }
+  else {
     Serial.println("[Error] Failed to start listening on UDP socket");
   }
+
+  registerHandler(TYPE_HELLO, [this](Message msg) { processHelloPacket(msg); });
+  registerHandler(TYPE_ROUTE, [this](Message msg) { processRoutePacket(msg); });
+}
+
+void Mesh::onMessage(const MessageHandler& handler) {
+  registerHandler(TYPE_MESSAGE, handler);
+}
+
+void Mesh::registerHandler(uint8_t type, const MessageHandler& handler) {
+  messageHandlers[type] = handler;
+}
+
+bool Mesh::send(const Message& msg, const ChipID& destination) {
+  send(msg, destination, TYPE_MESSAGE);
 }
 
 void Mesh::cbHelloTimer() {
-  Serial.println("[Info] Hello Timer");
-  
-  /*****Update external AP information*****/
-  auto newStatus = WiFi.status();
-  if(newStatus != status) {
-    status = newStatus;
-  
-    if(status == WL_CONNECTED) {
-      apNeighbor.nextHop = getDefaultGateway();
-  
-      Serial.print("[Info] AP Neighbor: ");
-      Serial.print(apNeighbor.nextHop);
-      Serial.print("\t");
-      Serial.print(Router::chipIDToString(apNeighbor.link.target));
-      Serial.print("\t");
-      Serial.println(apNeighbor.link.cost);
-  
-      uint8_t mySubnet = WiFi.softAPIP()[2];
-      uint8_t apNeighborSubnet = apNeighbor.nextHop[2];
-  
-      if(mySubnet == apNeighborSubnet) {
-        Serial.println("[Info] AP Neighbor using same subnet. Selecting new subnet");
-        setRandomSubnet();
-      }
-    }
-  }
-
   /*****Prune inactive neighbors*****/
   for(int i = 0; i < stationNeighbors.size(); ++i) {
     stationNeighbors[i].ttl--;
     if(stationNeighbors[i].ttl == 0) {
       Serial.print("[Info] Neighbor has timed out: ");
-      Serial.println(Router::chipIDToString(stationNeighbors[i].route.link.target));
+      Serial.println(chipIDToString(stationNeighbors[i].route.link.target));
       
       stationNeighbors.erase(stationNeighbors.begin() + i);
       --i;
@@ -96,49 +98,37 @@ void Mesh::cbHelloTimer() {
   }
 
   /*****Send Hello packet to neighbors*****/
-  if(status == WL_CONNECTED) {
+  if(wifiState == WiFiState::Connected) {
     //Update link cost
     apNeighbor.link.cost = -WiFi.RSSI();
+
+    Message msg;
+    msg.write(apNeighbor.link.cost >> 8);
+    msg.write(apNeighbor.link.cost & 0xFF);
     
-    //Send Hello packet
-    auto id = router.getChipID();
-    std::vector<uint8_t> packet(id.begin(), id.end());
-    packet.push_back(apNeighbor.link.cost);
-    packet.push_back(0);
-    
-    sendPacket(apNeighbor.nextHop, packet, Type::Hello);
+    send(msg, apNeighbor.link.target, TYPE_HELLO);
   }
 }
 
 void Mesh::cbRouteTimer() {
-  Serial.println("[Info] Route Timer");
-  
-  /*****WiFi Station Scan*****/
-  scan_config config {
-    .ssid = nullptr,
-    .bssid = nullptr,
-    .channel = CHANNEL,
-    .show_hidden = 0
-  };
-  wifi_station_scan(&config, [](void* bssInfo, STATUS status) { __meshPtr->cbStationScan(bssInfo, status); });
-
   /*****Update Neighbor Lists*****/
   std::vector<Router::Route> neighbors;
-  neighbors.reserve(stationNeighbors.size() + (status == WL_CONNECTED));
+  neighbors.reserve(stationNeighbors.size() + (wifiState == WiFiState::Connected));
 
   std::vector<Router::Link> links;
-  links.reserve(neighbors.size() + (status == WL_CONNECTED));
+  links.reserve(neighbors.size() + (wifiState == WiFiState::Connected));
   
   for(const auto& neighbor : stationNeighbors) {
     neighbors.push_back(neighbor.route);
     links.push_back(neighbor.route.link);
   }
-  if(status == WL_CONNECTED) {
+  if(wifiState == WiFiState::Connected) {
     neighbors.push_back(apNeighbor);
     links.push_back(apNeighbor.link);
   }
 
   /*****Send routing information flood*****/
+  /*
   std::vector<uint8_t> routePacket;
   routePacket.reserve(8 + 8*links.size());
 
@@ -149,149 +139,134 @@ void Mesh::cbRouteTimer() {
   routePacket.insert(routePacket.end(), linkPtr, linkPtr + 8*links.size());
   sendPacketToNeighbors(routePacket, Type::RouteUpdate);
   routeSeqNum++;
+  */
 
   /*****Update routing table*****/
   router.updateNeighbors(neighbors);
   router.updateRoutingTable();
 
+  router.printNetworkGraph();
+  router.printRoutingTable();
+  Serial.println();
+
+/*
   if(digitalRead(VERBOSE_PIN) == LOW) {
     router.printNetworkGraph();
 
     router.printRoutingTable();
     Serial.println();
   }
-}
-
-void Mesh::run() {
-  auto curTime = millis();
-
-  if(pingState != -1 && curTime >= nextPingTime) {
-    nextPingTime = curTime + PING_PERIOD;
-
-    if(pingState > 0) {
-      ping();
-      pingState--;
-    }
-    else {
-      int responses = std::count(pingTimes.begin(), pingTimes.end(), 0);
-      float avgTime = (responses == 0) ? 0.f : totalPingTime / (1000.f*responses);
-
-      Serial.print("Ping Report - ");
-      Serial.println(Router::chipIDToString(pingQueue.front()));
-      Serial.print("\t");
-      Serial.print(pingTimes.size());
-      Serial.print(" packets transmitted, ");
-      Serial.print(responses);
-      Serial.print(" received, ");
-      Serial.print(100 - 100*responses/pingTimes.size());
-      Serial.print("% packet loss, average rtt = ");
-      Serial.print(avgTime);
-      Serial.println(" ms\n");
-
-      pingQueue.pop();
-      if(pingQueue.empty()) {
-        pingState = -1;
-
-        Serial.println("-----Network Test Complete-----");
-      }
-      else {
-        pingTimes.clear();
-        totalPingTime = 0;
-
-        Serial.print("Ping - ");
-        Serial.println(Router::chipIDToString(pingQueue.front()));
-        
-        ping();
-        pingState = 4;
-      }
-    }
-  }
-
-  int length;
-  while((length = socket.parsePacket()) > 0) {
-    if(length < 4) {
-      Serial.println("[Error] Received packet with of length < 4");
-    }
-    else {
-      uint8_t type = socket.read();
-      uint8_t hopCount = socket.read();
-
-      //Discard padding
-      socket.read();
-      socket.read();
-
-      std::vector<uint8_t> packet(socket.available());
-      
-      if(socket.available() > 0) {
-        socket.read(packet.data(), packet.size());
-      }
-
-      switch(type) {
-        case static_cast<int>(Type::Hello):
-          processHelloPacket(packet);
-        break;
-
-        case static_cast<int>(Type::RouteUpdate):
-          processRoutePacket(packet);
-        break;
-
-        case static_cast<int>(Type::Ping):
-          processPingPacket(packet);
-        break;
-
-        case static_cast<int>(Type::Datagram):
-          if(packet.size() >= sizeof(Router::ChipID)) {
-            Router::ChipID target;
-            std::copy(packet.begin(), packet.begin() + sizeof(Router::ChipID), target.begin());
-
-            if(target == router.getChipID()) {
-              packet.erase(packet.begin(), packet.begin() + sizeof(Router::ChipID));
-              handler(packet);
-            }
-            else {
-              sendPacketToNeighbors(packet, static_cast<Type>(type), hopCount++);
-            }
-          }
-          else {
-            Serial.print("[Error] Packet of type Datagram received with length < ");
-            Serial.println(sizeof(Router::ChipID));
-          }
-        break;
-
-        default:
-          Serial.print("[Error] Datagram with invalid type received: ");
-          Serial.println(static_cast<int>(type));
-        break;
-      }
-    }
-  }
-}
-/*
-void Mesh::cbStationModeDisconnected(const WiFiEventStationModeDisconnected&) {
-  
-}
-
-void Mesh::cbStationModeGotIP(const WiFiEventModeGotIP&) {
-  
-}
-
-void Mesh::cbSoftAPModeStationConnected(const WiFiEventSoftAPModeStationConnected&) {
-  
-}
-
-void Mesh::cbSoftAPModeStationDisconnected(const WiFiEventSoftAPModeStationDisconnected&) {
-  
-}
 */
+}
+
+void Mesh::cbStationModeDisconnected(const WiFiEventStationModeDisconnected&) {
+  os_timer_disarm(&scanTimer);
+  os_timer_arm(&scanTimer, SCAN_PERIOD, 1);
+  
+  wifiState = WiFiState::Disconnected;
+  Serial.println("[Info] Station Mode Disconnected");
+}
+
+void Mesh::cbStationModeGotIP(const WiFiEventStationModeGotIP&) {
+  os_timer_disarm(&scanTimer);
+  os_timer_arm(&scanTimer, SCAN_PERIOD, 1);
+
+  wifiState = WiFiState::Connected;
+  Serial.println("[Info] Station Mode Connected");
+
+  apNeighbor.nextHop = getDefaultGateway();
+
+  Serial.print("[Info] AP Neighbor: ");
+  Serial.print(apNeighbor.nextHop);
+  Serial.print("\t");
+  Serial.print(chipIDToString(apNeighbor.link.target));
+  Serial.print("\t");
+  Serial.println(apNeighbor.link.cost);
+
+  uint8_t mySubnet = WiFi.softAPIP()[2];
+  uint8_t apNeighborSubnet = apNeighbor.nextHop[2];
+
+  if(mySubnet == apNeighborSubnet) {
+    Serial.println("[Info] AP Neighbor using same subnet. Selecting new subnet");
+    setRandomSubnet();
+  }
+}
+
+void Mesh::startScan() {
+  scan_config config {
+    .ssid = nullptr,
+    .bssid = nullptr,
+    .channel = CHANNEL,
+    .show_hidden = 0
+  };
+  wifi_station_scan(&config, [](void* bssInfo, STATUS status) { __meshPtr->cbStationScan(bssInfo, status); });
+}
+
+void Mesh::processPacket(AsyncUDPPacket packet) {
+  const auto* data = packet.data();
+  auto length = packet.length();
+
+  if(length < 16) {
+    Serial.println("[Error] Received invalid datagram");
+  }
+  else {
+    ChipID source;
+    ChipID destination;
+    std::copy(data, data+6, source.begin());
+    std::copy(data+6, data+12, destination.begin());
+    
+    uint8_t sequenceNumber = (data[12] << 8) | data[13];
+
+    if(isDuplicate(source, sequenceNumber)) {
+      Serial.print("[Warning] Rejecting duplicate packet from ");
+      Serial.print(chipIDToString(source));
+      Serial.print(" with sequence number ");
+      Serial.println(sequenceNumber);
+    }
+    else {
+      sequenceTable[source] = sequenceNumber;
+      
+      bool broadcast = isBroadcast(destination);
+      uint8_t type = data[14];
+  
+      if(isBroadcast || destination == myID) {
+        auto handler = messageHandlers.find(type);
+        if(handler == messageHandlers.end()) {
+          Serial.print("[Error] Message of type ");
+          Serial.print(static_cast<int>(type));
+          Serial.println(" received without registered handler");
+        }
+        else {
+          (handler->second)({data+16, length-16, source, packet.remoteIP()});
+        }
+      }
+      if(isBroadcast) {
+        sendToNeighbors({data+16, length-16, source, packet.remoteIP()}, type, myID);
+      }
+      else if(destination != myID) {
+        send({data+16, length-16, source, packet.remoteIP()}, destination, type);
+      }
+    }
+  }
+}
+
+bool Mesh::isDuplicate(const ChipID& id, uint16_t sequenceNumber) const {
+  auto found = sequenceTable.find(id);
+  return (found != sequenceTable.end()) && (found->second == sequenceNumber);
+}
+
+bool Mesh::isBroadcast(const ChipID& id) {
+  return id == ChipID{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+}
+
 void Mesh::cbStationScan(void *arg, STATUS status) {
-  auto curTime = millis();
   auto* bssInfo = reinterpret_cast<bss_info*>(arg);
   int networkCount;
   
   ssids.clear();
   
   for(networkCount = 0; bssInfo != nullptr; bssInfo = STAILQ_NEXT(bssInfo, next), ++networkCount) {
-    Router::ChipID id;
+    ChipID id;
 
     if(ssidToChipID(id, String(reinterpret_cast<char*>(bssInfo->ssid)))) {
       SSID ssid{id, -bssInfo->rssi};
@@ -303,6 +278,7 @@ void Mesh::cbStationScan(void *arg, STATUS status) {
     }
   }
 
+/*
   Serial.print("[Info] WiFi Scan - Found ");
   Serial.print(ssids.size());
   Serial.print(" Mesh Nodes (out of ");
@@ -313,84 +289,40 @@ void Mesh::cbStationScan(void *arg, STATUS status) {
     Serial.println("\tChipID\t\t\tCost");
 
     for(const auto& ssid : ssids) {
-      Serial.print(String("\t") + Router::chipIDToString(ssid.id) + "\t");
+      Serial.print(String("\t") + chipIDToString(ssid.id) + "\t");
       Serial.println(ssid.cost);
     }
-
-    if(status != WL_CONNECTED && curTime >= nextConnectTime) {
-      auto connectSSID = chipIDToSSID(ssids[0].id);
-      Serial.print("[Info] Connecting to lowest cost device ");
-      Serial.print(Router::chipIDToString(ssids[0].id));
-      Serial.print(" (");
-      Serial.print(connectSSID);
-      Serial.println(")");
-    
-      WiFi.begin(connectSSID.c_str());
-      apNeighbor.link.target = ssids[0].id;
-      apNeighbor.link.cost = ssids[0].cost;
-
-      nextConnectTime = (nextConnectTime == 0) ? (curTime + CONNECT_PERIOD) : (nextConnectTime + CONNECT_PERIOD);
-    }
   }
-}
+*/
 
-void Mesh::runNetworkTest() {
-  router.printNetworkGraph();
-  router.printRoutingTable();
-  Serial.println();
-  
-  if(pingQueue.empty()) {
-    Serial.println("-----Starting Network Test-----");
-    
-    auto nodes = router.getAllNodes();
+  if(wifiState != WiFiState::Connected && !ssids.empty()) {
+    connect(chipIDToSSID(ssids[0].id));
 
-    if(!nodes.empty()) {
-      for(const auto& node : nodes) {
-        pingQueue.push(node);
-      }
-      pingTimes.clear();
-      totalPingTime = 0;
-  
-      Serial.print("Ping - ");
-      Serial.println(Router::chipIDToString(pingQueue.front()));
+    if(wifiState == WiFiState::Disconnected) {
+      wifiState = WiFiState::Connecting;
       
-      ping();
-      pingState = 4;
+      os_timer_disarm(&scanTimer);
+      os_timer_arm(&scanTimer, CONNECT_TIMEOUT, 1);
     }
-    else {
-      Serial.println("-----Network Test Complete-----");
-    }
+    
+    apNeighbor.link.target = ssids[0].id;
+    apNeighbor.link.cost = ssids[0].cost;
   }
 }
 
-void Mesh::ping() {
-  if(pingQueue.empty()) {
-    Serial.println("[Error] Ping(): pingQueue is empty");
-  }
-  else {
-    auto me = router.getChipID();
-    const auto& target = pingQueue.front();
-    
-    std::vector<uint8_t> packet;
-  
-    packet.push_back(pingTimes.size());
-    packet.insert(packet.end(), target.begin(), target.end());
-    packet.insert(packet.end(), me.begin(), me.end());
+void Mesh::connect(const String& ssid) {
+  Serial.print("[Info] Connecting to SSID ");
+  Serial.println(ssid);
 
-    IPAddress nextHop;
-    if(router.getNextHop(nextHop, target)) {
-      sendPacket(nextHop, packet, Type::Ping);
-      pingTimes.push_back(micros());
-    }
-    else {
-      Serial.print("Ping - No route to device ");
-      Serial.println(Router::chipIDToString(target));
-    }
-  }
+  WiFi.begin(ssid.c_str());
+}
+
+void Mesh::cbScanTimer() {
+  startScan();
 }
 
 void Mesh::setRandomSubnet() {
-  uint8_t subnet = rand() % 255;
+  uint8_t subnet = rand() & 0xFF;
   Serial.print("[Info] Selected new subnet ");
   Serial.println(static_cast<int>(subnet));
 
@@ -398,25 +330,27 @@ void Mesh::setRandomSubnet() {
   WiFi.softAPConfig(newGateway, newGateway, {255, 255, 255, 0});
 }
 
-void Mesh::processHelloPacket(const std::vector<uint8_t>& packet) {
-  if(packet.size() != 8) {
-    Serial.print("[Error] Packet of type Hello received with invalid length ");
-    Serial.println(packet.size());
+void Mesh::processHelloPacket(Message msg) {
+  if(msg.size() != 2) {
+    Serial.print("[Error] Message of type Hello received with invalid length ");
+    Serial.println(msg.size());
   }
   else {
-    Router::ChipID chipID;
-    std::copy(packet.begin(), packet.begin() + 6, chipID.begin());
+    Serial.print("[Info] Received hello packet from ");
+    Serial.println(chipIDToString(msg.sender()));
+    
+    const auto* data = msg.data();
+    auto sender = msg.sender();
+    uint16_t cost = (data[0] << 8) | (data[1]);
 
-    uint8_t cost = packet[6];
-
-    auto neighbor = std::find_if(stationNeighbors.begin(), stationNeighbors.end(), [&chipID](const Neighbor& n) {
-        return n.route.link.target == chipID;
+    auto neighbor = std::find_if(stationNeighbors.begin(), stationNeighbors.end(), [&sender](const Neighbor& n) {
+        return n.route.link.target == sender;
       });
     if(neighbor == stationNeighbors.end()) {
       Serial.print("[Info] Found new neighbor: ");
-      Serial.println(Router::chipIDToString(chipID));
+      Serial.println(chipIDToString(sender));
       
-      stationNeighbors.push_back({{{chipID, cost}, socket.remoteIP()}, NEIGHBOR_MAX_TTL});
+      stationNeighbors.push_back({{{sender, cost}, msg.senderIP()}, NEIGHBOR_MAX_TTL});
     }
     else {
       neighbor->ttl = NEIGHBOR_MAX_TTL;
@@ -425,176 +359,68 @@ void Mesh::processHelloPacket(const std::vector<uint8_t>& packet) {
   }
 }
 
-void Mesh::processRoutePacket(const std::vector<uint8_t>& packet) {
-/*
-  Serial.println("[Info] Received Route Packet: ");
-  for(const auto& element : packet) {
-    Serial.print((int)element, HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
-*/
-
-  if(packet.size() < 8) {
+void Mesh::processRoutePacket(Message msg) {
+  //Check if payload size is multiple of 8
+  if((msg.size() & 0x07) != 0) {
     Serial.print("[Error] Route Update packet received with invalid length (");
-    Serial.print(packet.size());
+    Serial.print(msg.size());
     Serial.println(")");
   }
   else {
-    Router::ChipID id;
-    std::copy(packet.begin(), packet.begin() + 6, id.begin());
-    uint16_t seqNum = (packet[6] << 8) | packet[7];
-
-    bool alreadySeen = false;
-    auto lastSeq = routeSeqTable.find(id);
-    if(lastSeq == routeSeqTable.end()) {
-      routeSeqTable[id] = seqNum;
-    }
-    else if(lastSeq->second == seqNum) {
-      alreadySeen = true;
-    }
-    else {
-      lastSeq->second = seqNum;
-    }
-
-    if(alreadySeen) {
-/*
-      Serial.print("[Info] Discarding stale routing update from ");
-      Serial.print(Router::chipIDToString(id));
-      Serial.print(" (");
-      Serial.print(seqNum);
-      Serial.println(")");
-*/
-    }
-    else {
-/*
-      Serial.print("[Info] Received routing update from ");
-      Serial.println(Router::chipIDToString(id));
-*/
-      router.processLinkUpdate(id, reinterpret_cast<const Router::Link*>(packet.data() + 8),
-        packet.size()/8 - 1);
-
-      //Forward to other neighbors
-      sendPacketToNeighbors(packet, Type::RouteUpdate, id);
-    }
+    Serial.print("[Info] Received hello packet from ");
+    Serial.println(chipIDToString(msg.sender()));
+    
+    auto sender = msg.sender();
+    
+    router.processLinkUpdate(sender, reinterpret_cast<const Router::Link*>(msg.data()),
+      msg.size() >> 3);
   }
 }
 
-void Mesh::processPingPacket(const std::vector<uint8_t>& packet) {
-  auto curTime = micros();
-  
-  Router::ChipID sender, target, me = router.getChipID();
+bool Mesh::send(const Message& msg, const ChipID& destination, uint8_t type) {
+  IPAddress nextHop;
+  if(!router.getNextHop(nextHop, destination)) {
+    Serial.print("[Error] Mesh::send: No route to destination '");
+    Serial.print(chipIDToString(destination));
+    Serial.println("'");
 
-  std::copy(packet.begin()+1, packet.begin()+7, target.begin());
-  std::copy(packet.begin()+7, packet.begin()+13, sender.begin());
-
-  bool toForward = true;;
-
-  if(target == me) {
-    if(sender == me) {
-      toForward = false;
-      int seqNum = packet[0];
-
-      if(seqNum >= pingTimes.size()) {
-        Serial.println("[Error] Ping: Invalid sequence number");
-      }
-      else {
-        if(pingTimes[seqNum] == 0) {
-          Serial.print("[Info] Ping: Received duplicate response (");
-          Serial.print((int)seqNum);
-          Serial.println(")");
-        }
-        else {
-          auto dt = curTime - pingTimes[seqNum];
-          
-          Serial.print("\tPing response (");
-          Serial.print((int)seqNum);
-          Serial.print("): ");
-          Serial.print(dt/1000.f);
-          Serial.print("ms\n\tRoute: ");
-
-          int hopCount = (packet.size()-7)/6;
-          for(int i = 0; i < hopCount; ++i) {
-            Router::ChipID hop;
-            int offset = 7+6*i;
-            std::copy(packet.begin()+offset, packet.begin()+offset+6, hop.begin());
-
-            Serial.print(Router::chipIDToString(hop));
-            Serial.print("->");
-          }
-          Serial.println(Router::chipIDToString(me));
-          Serial.println();
-  
-          pingTimes[seqNum] = 0;
-          totalPingTime += dt;
-        }
-      }
-    }
-    else {
-      target = sender;
-      toForward = true;
-    }
+    return false;
   }
+  else {
+    AsyncUDPMessage msgOut(16 + msg.size());
+    auto sequenceNumber = sequenceTable[myID]++;
+    
+    msgOut.write(myID.data(), myID.size());
+    msgOut.write(destination.data(), destination.size());
+    msgOut.write(sequenceNumber >> 8);
+    msgOut.write(sequenceNumber & 0xFF);
+    msgOut.write(type);
+    msgOut.write(0);
+    msgOut.write(msg.data(), msg.size());
 
-  if(toForward) {
-    std::vector<uint8_t> newPacket = packet;
-    std::copy(target.begin(), target.end(), newPacket.begin()+1);
-    newPacket.insert(newPacket.end(), me.begin(), me.end());
-  
-    Serial.print("[Info] Ping: Forwarding packet (from ");
-    Serial.print(Router::chipIDToString(sender));
-    Serial.print(" to ");
-    Serial.print(Router::chipIDToString(target));
-    Serial.println(")");
-  
-    IPAddress nextHop;
-    if(router.getNextHop(nextHop, target)) {
-      sendPacket(nextHop, newPacket, Type::Ping);
-    }
-    else {
-      Serial.print("Ping Forward - No route to device ");
-      Serial.println(Router::chipIDToString(target));
-    }
+    Serial.print("[Info] Sending packet to ");
+    Serial.print(chipIDToString(destination));
+    Serial.print(" (");
+    Serial.print(msg.size());
+    Serial.println(" bytes)");
+    
+    socket.sendTo(msgOut, nextHop, PORT);
+
+    return true;
   }
 }
 
-void Mesh::sendPacketToNeighbors(const std::vector<uint8_t>& packet, Type type, uint8_t hopCount) {
-  for(auto& neighbor : stationNeighbors) {
-    sendPacket(neighbor.route.nextHop, packet, type, hopCount);
-  }
-  if(status == WL_CONNECTED) {
-    sendPacket(apNeighbor.nextHop, packet, type, hopCount);
-  }
-}
-
-void Mesh::sendPacketToNeighbors(const std::vector<uint8_t>& packet, Type type, const Router::ChipID& except, uint8_t hopCount) {
+void Mesh::sendToNeighbors(const Message& msg, uint8_t type, const ChipID& except) {
   for(auto& neighbor : stationNeighbors) {
     if(neighbor.route.link.target != except) {
-      sendPacket(neighbor.route.nextHop, packet, type, hopCount);
+      send(msg, neighbor.route.link.target, type);
     }
   }
-  if(status == WL_CONNECTED) {
+  if(wifiState == WiFiState::Connected) {
     if(apNeighbor.link.target != except) {
-      sendPacket(apNeighbor.nextHop, packet, type, hopCount);
+      send(msg, apNeighbor.link.target, type);
     }
   }
-}
-
-void Mesh::sendPacket(const IPAddress& ip, const std::vector<uint8_t>& packet, Type type, uint8_t hopCount) {
-  socket.beginPacket(ip, PORT);
-
-  //Header
-  socket.write(static_cast<uint8_t>(type));
-  socket.write(hopCount);
-
-  //Padding
-  socket.write(static_cast<uint8_t>(0));
-  socket.write(static_cast<uint8_t>(0));
-
-  //Packet
-  socket.write(packet.data(), packet.size());
-
-  socket.endPacket();
 }
 
 IPAddress Mesh::getDefaultGateway() {
@@ -604,16 +430,11 @@ IPAddress Mesh::getDefaultGateway() {
   return myIP;
 }
 
-bool Mesh::ssidToChipID(Router::ChipID& out, const String& ssid) {
-  String start{SSID_START};
-  
-  if( (ssid.length() == (start.length() + 12+5))
-    && (ssid.substring(0, start.length()) == start)) {
+bool Mesh::ssidToChipID(ChipID& out, const String& ssid) {
+  if( (ssid.length() == (meshName_.length() + 12+6))
+    && (ssid.substring(0, meshName_.length()) == meshName_)) {
 
-    Serial.print("[Info] SSID String: ");
-    Serial.println(ssid.substring(start.length()));
-
-    out = Router::stringToChipID(ssid.substring(start.length()));
+    out = stringToChipID(ssid.substring(meshName_.length()+1));
     return true;
   }
   else {
@@ -621,7 +442,27 @@ bool Mesh::ssidToChipID(Router::ChipID& out, const String& ssid) {
   }
 }
 
-String Mesh::chipIDToSSID(const Router::ChipID& id) {
-  return String(SSID_START) + Router::chipIDToString(id);
+String Mesh::chipIDToSSID(const ChipID& id) {
+  return meshName_ + " " + chipIDToString(id);
+}
+
+String Mesh::chipIDToString(const ChipID& id) {
+  return String(id[0], HEX) + ":"
+    + String(id[1], HEX) + ":"
+    + String(id[2], HEX) + ":"
+    + String(id[3], HEX) + ":"
+    + String(id[4], HEX) + ":"
+    + String(id[5], HEX);
+}
+
+ChipID Mesh::stringToChipID(const String& str) {
+  ChipID id;
+
+  for(int i = 0; i < id.size(); ++i) {
+    auto substr = str.substring(3*i, 3*i+2);
+    id[i] = strtol(substr.c_str(), nullptr, 16);
+  }
+
+  return id;
 }
 

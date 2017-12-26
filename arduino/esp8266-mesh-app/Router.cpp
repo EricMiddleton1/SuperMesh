@@ -4,6 +4,8 @@
 #include <limits>
 #include <algorithm>
 
+#include "Mesh.h"
+
 using namespace std;
 
 Router::Node::Node(const ChipID& _id)
@@ -23,7 +25,7 @@ void Router::begin(const ChipID& id) {
   networkGraph.emplace_back(myID);
 }
 
-Router::ChipID Router::getChipID() const {
+ChipID Router::getChipID() const {
   return myID;
 }
 
@@ -42,7 +44,7 @@ bool Router::getNextHop(Address& nextHop, const ChipID& id) const {
   }
 }
 
-std::vector<Router::ChipID> Router::getAllNodes() const {
+std::vector<ChipID> Router::getAllNodes() const {
   std::vector<ChipID> nodes;
 
   for(const auto& node : routingTable) {
@@ -204,7 +206,7 @@ void Router::printRoutingTable() const {
     Serial.println("\tChipID\t\t\tNext Hop\t\t\tCost");
     for(const auto& route : routingTable) {
       Serial.print("\t");
-      Serial.print(chipIDToString(route.link.target));
+      Serial.print(Mesh::chipIDToString(route.link.target));
       Serial.print("\t");
       Serial.print(route.nextHop);
       Serial.print("\t\t\t");
@@ -220,35 +222,15 @@ void Router::printNetworkGraph() const {
 
   for(const auto& node : networkGraph) {
     Serial.print("\t");
-    Serial.print(chipIDToString(node.id));
+    Serial.print(Mesh::chipIDToString(node.id));
     Serial.print("\t\t\t");
     Serial.println(node.cost);
     for(const auto& edge : node.edges) {
       Serial.print("\t\t");
-      Serial.print(chipIDToString(networkGraph[edge.nodeIndex].id));
+      Serial.print(Mesh::chipIDToString(networkGraph[edge.nodeIndex].id));
       Serial.print("\t\t\t");
       Serial.println(edge.cost);
     }
   }
-}
-
-String Router::chipIDToString(const ChipID& id) {
-  return String(id[0], HEX) + ":"
-    + String(id[1], HEX) + ":"
-    + String(id[2], HEX) + ":"
-    + String(id[3], HEX) + ":"
-    + String(id[4], HEX) + ":"
-    + String(id[5], HEX);
-}
-
-Router::ChipID Router::stringToChipID(const String& str) {
-  ChipID id;
-
-  for(int i = 0; i < id.size(); ++i) {
-    auto substr = str.substring(3*i, 3*i+2);
-    id[i] = strtol(substr.c_str(), nullptr, 16);
-  }
-
-  return id;
 }
 

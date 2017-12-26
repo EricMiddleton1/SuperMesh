@@ -6,9 +6,10 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 
+#include "Types.h"
+
 class Router {
 public:
-  using ChipID = std::array<uint8_t, 6>;
   using Address = IPAddress;
   using CostType = uint16_t;
 
@@ -48,9 +49,6 @@ public:
 
   void printRoutingTable() const;
   void printNetworkGraph() const;
-
-  static String chipIDToString(const ChipID& id);
-  static ChipID stringToChipID(const String& str);
 
 private:
   struct Node {
